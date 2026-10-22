@@ -1,0 +1,89 @@
+'DEFINES-------------------------------------------------------------
+
+'--- Network (static IP) ---
+'DEVICE_IP must match the IP in the device's server certificate (server_bundle.der).
+const DEVICE_IP   = "192.168.1.218"
+const DEVICE_MASK = "255.255.255.0"
+const DEVICE_GW   = "192.168.1.1"
+
+'--- PC server used to test the CA certificate ---
+'PC_IP must match the IP in the PC server's certificate (ca_cert.der).
+const PC_IP       = "192.168.1.70"
+const PC_TLS_PORT = 9443
+
+'--- Ports ---
+const TLS_SERVER_PORT    = "8443"               'TLS echo server, uses the server bundle
+const CA_UPLOAD_PORT     = "9100"               'send a new ca_cert.der here
+const BUNDLE_UPLOAD_PORT = "9101"               'send a new server_bundle.der here
+
+'--- Sockets ---
+const TLS_SERVER_SOCK    = 0
+const TLS_CLIENT_SOCK    = 1
+const CA_UPLOAD_SOCK     = 2
+const BUNDLE_UPLOAD_SOCK = 3
+const NO_SOCK            = 255      'no socket is receiving an upload
+
+'Buffer sizes in pages (1 page = 256 bytes). 6 pages suits ECDSA P-256; use 8 for RSA 2048.
+#define TLS_RX_BUFF    6
+#define TLS_TX_BUFF    6
+#define UPLOAD_RX_BUFF 2
+#define UPLOAD_TX_BUFF 1
+
+'--- Certificate files ---
+const ROM_CA_FILE        = "ca_cert.der"        'ROM file copied to the flash disk on first boot
+const ROM_BUNDLE_FILE    = "server_bundle.der"  'ROM file copied to the flash disk on first boot
+const FD_CA_FILE         = "ca.der"             'flash disk file the TLS client test uses
+const FD_BUNDLE_FILE     = "bundle.der"         'flash disk file the TLS server uses
+const FD_CA_BAK          = "ca.bak"             'previous copy, exists only during an update
+const FD_BUNDLE_BAK      = "bundle.bak"         'previous copy, exists only during an update
+const FD_NEW_FILE        = "new.der"            'a replacement while it is being received
+
+const CERT_MAX_SIZE      = 3072     'largest accepted certificate file, in bytes (RAM array size)
+const CA_DER_OBJECTS     = 1        'a CA file is one certificate
+const BUNDLE_DER_OBJECTS = 2        'a server bundle is a certificate followed by a key
+const CERT_FILENUM       = 0        'flash disk file slot for the certificate files
+const NEW_FILENUM        = 1        'flash disk file slot for FD_NEW_FILE
+
+'--- Timing (on_sys_timer ticks, 0.5 s each) ---
+const LONG_PRESS_TICKS   = 5        'hold MD this long (about 2.5 s) to restore the ROM certificates
+const UPLOAD_TIMEOUT_TICKS = 20     'abandon an upload whose sender has not closed within 10 s
+const CLIENT_TIMEOUT_TICKS = 30     'abandon a TLS client test that has not finished within 15 s
+
+enum en_cert_target
+    CERT_CA,                        'CA certificate, checks the PC server (TLS client)
+    CERT_BUNDLE                     'device certificate + key (TLS server)
+end enum
+
+'INCLUDES------------------------------------------------------------
+
+'DECLARATIONS--------------------------------------------------------
+'cert_store.tbs
+declare sub cert_store_init()
+declare sub cert_store_reset()
+declare function cert_fd_name(target as en_cert_target) as string
+declare function cert_bak_name(target as en_cert_target) as string
+declare function cert_label(target as en_cert_target) as string
+declare function fd_exists(byref fname as string) as no_yes
+declare sub cert_prepare(target as en_cert_target)
+declare sub cert_load(target as en_cert_target)
+declare function cert_size(target as en_cert_target) as word
+declare function cert_tls_init(target as en_cert_target) as pl_tls_result
+declare function cert_new_open() as ok_ng
+declare function cert_new_write(byref data as string) as ok_ng
+declare sub cert_new_close()
+declare sub cert_new_discard()
+declare function cert_commit(target as en_cert_target) as ok_ng
+declare function cert_der_check(expected as byte) as ok_ng
+
+'main.tbs
+declare sub boot()
+declare sub restore_rom_certs()
+declare sub tls_server_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+declare sub tls_server_echo()
+declare sub client_start()
+declare sub client_end(reason as string)
+declare sub client_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+declare sub upload_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+declare sub upload_read()
+declare sub upload_abort(reason as string)
+declare function upload_target(num as byte) as en_cert_target

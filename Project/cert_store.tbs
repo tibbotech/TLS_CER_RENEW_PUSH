@@ -1,0 +1,413 @@
+include "global.tbh"
+
+'==============================================================================
+' Certificate store on the flash disk
+'
+' Each certificate is a flash disk file. At boot the file is copied into a RAM
+' array, and TLS is started from that array with sock.tlsinitfromarray().
+'
+'   CERT_CA      FD_CA_FILE      seeded from ROM_CA_FILE      used by the TLS client
+'   CERT_BUNDLE  FD_BUNDLE_FILE  seeded from ROM_BUNDLE_FILE  used by the TLS server
+'
+' A replacement is written to FD_NEW_FILE, checked, then swapped in by
+' cert_commit(). It takes effect at the next boot, when the arrays are reloaded.
+'==============================================================================
+
+dim ca_arr(CERT_MAX_SIZE) as byte
+dim ca_len as word
+dim bundle_arr(CERT_MAX_SIZE) as byte
+dim bundle_len as word
+
+dim new_open as no_yes      'YES while FD_NEW_FILE is open for writing
+dim new_bytes as word       'bytes written to FD_NEW_FILE so far
+
+'------------------------------------------------------------------------------
+'Mounts the flash disk (formatting it on first use), makes sure each certificate
+'file exists, and loads both certificates into RAM.
+sub cert_store_init()
+    ca_len = 0
+    bundle_len = 0
+    new_open = NO
+
+    if fd.mount <> PL_FD_STATUS_OK then
+        sys.debugprint("Flash disk not formatted. Formatting...\r\n")
+        if fd.formatj(fd.availableflashspace, 10, 100) <> PL_FD_STATUS_OK then
+            sys.debugprint("fd.formatj FAILED (" + str(fd.laststatus) + ")\r\n")
+            exit sub
+        end if
+        if fd.mount <> PL_FD_STATUS_OK then
+            sys.debugprint("fd.mount FAILED (" + str(fd.laststatus) + ")\r\n")
+            exit sub
+        end if
+    end if
+
+    cert_prepare(CERT_CA)
+    cert_prepare(CERT_BUNDLE)
+    cert_load(CERT_CA)
+    cert_load(CERT_BUNDLE)
+end sub
+
+'------------------------------------------------------------------------------
+function cert_fd_name(target as en_cert_target) as string
+    if target = CERT_CA then
+        cert_fd_name = FD_CA_FILE
+    else
+        cert_fd_name = FD_BUNDLE_FILE
+    end if
+end function
+
+'------------------------------------------------------------------------------
+'The previous copy, which exists only while cert_commit() is swapping files.
+function cert_bak_name(target as en_cert_target) as string
+    if target = CERT_CA then
+        cert_bak_name = FD_CA_BAK
+    else
+        cert_bak_name = FD_BUNDLE_BAK
+    end if
+end function
+
+'------------------------------------------------------------------------------
+function cert_label(target as en_cert_target) as string
+    if target = CERT_CA then
+        cert_label = "CA certificate"
+    else
+        cert_label = "server bundle"
+    end if
+end function
+
+'------------------------------------------------------------------------------
+function fd_exists(byref fname as string) as no_yes
+    fd.filenum = CERT_FILENUM
+    if fd.open(fname) = PL_FD_STATUS_OK then
+        fd.close
+        fd_exists = YES
+    else
+        fd_exists = NO
+    end if
+end function
+
+'------------------------------------------------------------------------------
+'Makes sure the certificate file for target exists:
+'  - a .bak with no current file means a commit was interrupted: restore it;
+'  - no file at all (first boot, or after cert_store_reset): copy the ROM file.
+sub cert_prepare(target as en_cert_target)
+    dim fname as string = cert_fd_name(target)
+    dim bak as string = cert_bak_name(target)
+
+    if fd_exists(fname) = YES then
+        if fd_exists(bak) = YES then fd.delete(bak)
+        exit sub
+    end if
+
+    if fd_exists(bak) = YES then
+        if fd.rename(bak, fname) = PL_FD_STATUS_OK then
+            sys.debugprint(cert_label(target) + ": restored the previous copy after an interrupted update\r\n")
+            exit sub
+        end if
+    end if
+
+    dim romname as string
+    if target = CERT_CA then
+        romname = ROM_CA_FILE
+    else
+        romname = ROM_BUNDLE_FILE
+    end if
+
+    romfile.open(romname)
+    if romfile.size = 0 then
+        sys.debugprint(cert_label(target) + ": no flash disk file and no ROM file '" + romname + "'\r\n")
+        exit sub
+    end if
+
+    if cert_new_open() <> OK then exit sub
+    romfile.pointer = 1
+    dim s as string = romfile.getdata(255)
+    while s <> ""
+        if cert_new_write(s) <> OK then
+            cert_new_discard()
+            exit sub
+        end if
+        s = romfile.getdata(255)
+    wend
+
+    if cert_commit(target) = OK then
+        sys.debugprint(cert_label(target) + ": copied from ROM file '" + romname + "'\r\n")
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+'Copies the flash disk file for target into its RAM array.
+sub cert_load(target as en_cert_target)
+    dim fname as string = cert_fd_name(target)
+    dim s as string
+    dim i, j as word
+    dim fsize as dword
+
+    if target = CERT_CA then
+        ca_len = 0
+    else
+        bundle_len = 0
+    end if
+
+    fd.filenum = CERT_FILENUM
+    if fd.open(fname) <> PL_FD_STATUS_OK then
+        sys.debugprint(cert_label(target) + ": cannot open '" + fname + "' (" + str(fd.laststatus) + ")\r\n")
+        exit sub
+    end if
+
+    fsize = fd.filesize
+    if fsize = 0 or fsize > CERT_MAX_SIZE then
+        sys.debugprint(cert_label(target) + ": '" + fname + "' has a bad size (" + str(fsize) + ")\r\n")
+        fd.close
+        exit sub
+    end if
+
+    fd.setpointer(1)
+    i = 0
+    s = fd.getdata(255)
+    while s <> ""
+        for j = 1 to len(s)
+            if target = CERT_CA then
+                ca_arr(i) = asc(mid(s, j, 1))
+            else
+                bundle_arr(i) = asc(mid(s, j, 1))
+            end if
+            i = i + 1
+        next j
+        s = fd.getdata(255)
+    wend
+    fd.close
+
+    if i <> fsize then
+        sys.debugprint(cert_label(target) + ": read " + str(i) + " of " + str(fsize) + " bytes\r\n")
+        exit sub
+    end if
+
+    if target = CERT_CA then
+        ca_len = i
+    else
+        bundle_len = i
+    end if
+    sys.debugprint(cert_label(target) + ": loaded '" + fname + "', " + str(i) + " bytes\r\n")
+end sub
+
+'------------------------------------------------------------------------------
+'Size of the certificate loaded for target; 0 means none is available.
+function cert_size(target as en_cert_target) as word
+    if target = CERT_CA then
+        cert_size = ca_len
+    else
+        cert_size = bundle_len
+    end if
+end function
+
+'------------------------------------------------------------------------------
+'Initializes TLS on the current socket (sock.num) from the certificate in RAM.
+'The caller must check cert_size(target) <> 0 first.
+function cert_tls_init(target as en_cert_target) as pl_tls_result
+    if target = CERT_CA then
+        cert_tls_init = sock.tlsinitfromarray(ca_arr, ca_len)
+    else
+        cert_tls_init = sock.tlsinitfromarray(bundle_arr, bundle_len)
+    end if
+end function
+
+'------------------------------------------------------------------------------
+'Deletes every certificate file from the flash disk. At the next boot
+'cert_prepare() finds none and copies the ROM files again, as on first boot.
+sub cert_store_reset()
+    cert_new_discard()
+    fd.delete(FD_CA_FILE)
+    fd.delete(FD_BUNDLE_FILE)
+    fd.delete(FD_CA_BAK)
+    fd.delete(FD_BUNDLE_BAK)
+end sub
+
+'==============================================================================
+' Receiving a replacement: cert_new_open -> cert_new_write ... -> cert_commit
+' (or cert_new_discard to give up)
+'==============================================================================
+
+'------------------------------------------------------------------------------
+function cert_new_open() as ok_ng
+    cert_new_open = NG
+    new_bytes = 0
+    new_open = NO
+
+    fd.filenum = NEW_FILENUM
+    if fd.open(FD_NEW_FILE) = PL_FD_STATUS_NOT_FOUND then
+        if fd.create(FD_NEW_FILE) <> PL_FD_STATUS_OK then
+            sys.debugprint("Cannot create '" + FD_NEW_FILE + "' (" + str(fd.laststatus) + ")\r\n")
+            exit function
+        end if
+        fd.open(FD_NEW_FILE)
+    end if
+    if fd.laststatus <> PL_FD_STATUS_OK then
+        sys.debugprint("Cannot open '" + FD_NEW_FILE + "' (" + str(fd.laststatus) + ")\r\n")
+        exit function
+    end if
+
+    if fd.setfilesize(0) <> PL_FD_STATUS_OK then
+        fd.close
+        exit function
+    end if
+
+    new_open = YES
+    cert_new_open = OK
+end function
+
+'------------------------------------------------------------------------------
+'Appends data to FD_NEW_FILE. Fails once the file would exceed CERT_MAX_SIZE,
+'so an oversized transfer is stopped early instead of filling the flash disk.
+function cert_new_write(byref data as string) as ok_ng
+    cert_new_write = NG
+    if new_open = NO then exit function
+
+    if new_bytes + len(data) > CERT_MAX_SIZE then
+        sys.debugprint("New file is larger than CERT_MAX_SIZE (" + str(CERT_MAX_SIZE) + " bytes)\r\n")
+        exit function
+    end if
+
+    fd.filenum = NEW_FILENUM
+    if fd.setdata(data) <> PL_FD_STATUS_OK then
+        sys.debugprint("Flash disk write FAILED (" + str(fd.laststatus) + ")\r\n")
+        exit function
+    end if
+
+    new_bytes = new_bytes + len(data)
+    cert_new_write = OK
+end function
+
+'------------------------------------------------------------------------------
+sub cert_new_close()
+    if new_open = NO then exit sub
+    fd.filenum = NEW_FILENUM
+    fd.flush
+    fd.close
+    new_open = NO
+end sub
+
+'------------------------------------------------------------------------------
+sub cert_new_discard()
+    cert_new_close()
+    fd.delete(FD_NEW_FILE)
+end sub
+
+'------------------------------------------------------------------------------
+'Checks FD_NEW_FILE and, if it is valid, makes it the certificate file for target.
+'
+'Swap order: current -> .bak, new -> current, delete .bak. If power fails part way,
+'cert_prepare() at the next boot restores the .bak. On any failure the current
+'file is left as it was and FD_NEW_FILE is deleted.
+function cert_commit(target as en_cert_target) as ok_ng
+    dim fname as string = cert_fd_name(target)
+    dim bak as string = cert_bak_name(target)
+    dim expected as byte
+
+    cert_commit = NG
+    cert_new_close()
+
+    if target = CERT_CA then
+        expected = CA_DER_OBJECTS
+    else
+        expected = BUNDLE_DER_OBJECTS
+    end if
+
+    if cert_der_check(expected) <> OK then
+        sys.debugprint(cert_label(target) + ": REJECTED, '" + fname + "' left unchanged\r\n")
+        fd.delete(FD_NEW_FILE)
+        exit function
+    end if
+
+    fd.delete(bak)
+    if fd_exists(fname) = YES then
+        if fd.rename(fname, bak) <> PL_FD_STATUS_OK then
+            sys.debugprint(cert_label(target) + ": rename to '" + bak + "' FAILED (" + str(fd.laststatus) + ")\r\n")
+            fd.delete(FD_NEW_FILE)
+            exit function
+        end if
+    end if
+
+    if fd.rename(FD_NEW_FILE, fname) <> PL_FD_STATUS_OK then
+        sys.debugprint(cert_label(target) + ": rename to '" + fname + "' FAILED (" + str(fd.laststatus) + ")\r\n")
+        fd.rename(bak, fname)
+        fd.delete(FD_NEW_FILE)
+        exit function
+    end if
+
+    fd.delete(bak)
+    cert_commit = OK
+end function
+
+'------------------------------------------------------------------------------
+'Checks that FD_NEW_FILE is exactly `expected` DER objects, each a SEQUENCE,
+'whose encoded lengths add up to the file size. This catches truncated and
+'padded transfers, non-DER files (e.g. PEM), and a file sent to the wrong
+'target (a CA certificate is 1 object, a server bundle is 2).
+'It does not check that a certificate and key belong together.
+function cert_der_check(expected as byte) as ok_ng
+    dim hdr as string
+    dim b1, nbytes, k, objects as byte
+    dim objlen, total, fsize as dword
+
+    cert_der_check = NG
+    fd.filenum = NEW_FILENUM
+    if fd.open(FD_NEW_FILE) <> PL_FD_STATUS_OK then exit function
+    fsize = fd.filesize
+    if fsize = 0 then
+        sys.debugprint("New file is empty\r\n")
+        fd.close
+        exit function
+    end if
+
+    total = 0
+    objects = 0
+    while total < fsize
+        objects = objects + 1
+        if objects > expected then
+            sys.debugprint("New file has more than " + str(expected) + " DER object(s)\r\n")
+            fd.close
+            exit function
+        end if
+
+        fd.setpointer(total + 1)
+        hdr = fd.getdata(6)
+        if len(hdr) < 2 or asc(mid(hdr, 1, 1)) <> &h30 then
+            sys.debugprint("DER object " + str(objects) + " is not a SEQUENCE\r\n")
+            fd.close
+            exit function
+        end if
+
+        'Short form: one length byte. Long form: &h80 + count, then the length bytes.
+        b1 = asc(mid(hdr, 2, 1))
+        if b1 < &h80 then
+            objlen = 2 + b1
+        else
+            nbytes = b1 and &h7F
+            if nbytes = 0 or nbytes > 4 or len(hdr) < 2 + nbytes then
+                sys.debugprint("DER object " + str(objects) + " has a malformed length\r\n")
+                fd.close
+                exit function
+            end if
+            objlen = 0
+            for k = 1 to nbytes
+                objlen = objlen * 256 + asc(mid(hdr, 2 + k, 1))
+            next k
+            objlen = objlen + 2 + nbytes
+        end if
+        total = total + objlen
+    wend
+    fd.close
+
+    if total <> fsize then
+        sys.debugprint("DER objects add up to " + str(total) + " bytes, file is " + str(fsize) + "\r\n")
+        exit function
+    end if
+    if objects <> expected then
+        sys.debugprint("New file has " + str(objects) + " DER object(s), expected " + str(expected) + "\r\n")
+        exit function
+    end if
+
+    sys.debugprint("New file OK: " + str(objects) + " DER object(s), " + str(total) + " bytes\r\n")
+    cert_der_check = OK
+end function

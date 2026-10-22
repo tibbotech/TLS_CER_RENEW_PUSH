@@ -1,0 +1,357 @@
+include "global.tbh"
+
+dim upload_sock as byte         'socket receiving an upload, or NO_SOCK
+dim upload_ticks as byte
+dim client_busy as no_yes       'YES while the TLS client test is running
+dim client_ticks as byte
+dim button_ticks as byte            'on_sys_timer ticks MD has been held
+dim long_press_done as no_yes       'YES: ignore the next release of MD
+dim reboot_pending as no_yes    'YES once a new certificate has been committed
+
+'------------------------------------------------------------------------------
+sub on_sys_init()
+    boot()
+end sub
+
+'------------------------------------------------------------------------------
+sub boot()
+    net.ip        = DEVICE_IP
+    net.netmask   = DEVICE_MASK
+    net.gatewayip = DEVICE_GW
+
+    upload_sock    = NO_SOCK
+    client_busy    = NO
+    reboot_pending = NO
+    button_ticks    = 0
+    long_press_done = NO
+
+    cert_store_init()
+
+    sock.num = TLS_SERVER_SOCK
+    sock.rxbuffrq(TLS_RX_BUFF)
+    sock.txbuffrq(TLS_TX_BUFF)
+    sock.num = TLS_CLIENT_SOCK
+    sock.rxbuffrq(TLS_RX_BUFF)
+    sock.txbuffrq(TLS_TX_BUFF)
+    dim i as byte
+    for i = CA_UPLOAD_SOCK to BUNDLE_UPLOAD_SOCK
+        sock.num = i
+        sock.rxbuffrq(UPLOAD_RX_BUFF)
+        sock.txbuffrq(UPLOAD_TX_BUFF)
+    next i
+    sys.buffalloc()
+    sys.debugprint("Buffer pages free after alloc: " + str(sys.freebuffpages) + "\r\n")
+
+    sock.num = TLS_SERVER_SOCK
+    sock.protocol      = PL_SOCK_PROTOCOL_TCP
+    sock.localportlist = TLS_SERVER_PORT
+    sock.inconmode     = PL_SOCK_INCONMODE_ANY_IP_ANY_PORT
+    sock.reconmode     = PL_SOCK_RECONMODE_1
+
+    sock.num = TLS_CLIENT_SOCK
+    sock.protocol  = PL_SOCK_PROTOCOL_TCP
+    sock.inconmode = PL_SOCK_INCONMODE_NONE
+    sock.reconmode = PL_SOCK_RECONMODE_0
+
+    sock.num = CA_UPLOAD_SOCK
+    sock.protocol      = PL_SOCK_PROTOCOL_TCP
+    sock.localportlist = CA_UPLOAD_PORT
+    sock.inconmode     = PL_SOCK_INCONMODE_ANY_IP_ANY_PORT
+
+    sock.num = BUNDLE_UPLOAD_SOCK
+    sock.protocol      = PL_SOCK_PROTOCOL_TCP
+    sock.localportlist = BUNDLE_UPLOAD_PORT
+    sock.inconmode     = PL_SOCK_INCONMODE_ANY_IP_ANY_PORT
+
+    sys.debugprint("CERT_UPDATE_PUSH ready. TLS server on port " + TLS_SERVER_PORT + ", uploads: CA certificate on " + CA_UPLOAD_PORT + ", server bundle on " + BUNDLE_UPLOAD_PORT + ". Press MD to test the CA certificate against " + PC_IP + ":" + str(PC_TLS_PORT) + "\r\n")
+    sys.debugprint("Hold MD for 2.5 s to restore the certificates from ROM.\r\n")
+end sub
+
+'------------------------------------------------------------------------------
+sub on_button_pressed()
+    button_ticks    = 0
+    long_press_done = NO
+end sub
+
+'------------------------------------------------------------------------------
+'A short press acts when MD is released. A long press acts in on_sys_timer while
+'MD is still held, so the release that follows it is ignored.
+sub on_button_released()
+    if long_press_done = YES then exit sub
+    if client_busy = YES then
+        sys.debugprint("MD: TLS client test already running\r\n")
+    else
+        client_start()
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sys_timer()
+    if button.pressed <> NO then
+        if long_press_done = NO then
+            button_ticks = button_ticks + 1
+            if button_ticks >= LONG_PRESS_TICKS then
+                long_press_done = YES
+                restore_rom_certs()
+            end if
+        end if
+    end if
+
+    'The reboot waits for a timer tick so the debug output above it is sent first,
+    'and until MD is released: a device that starts with MD pressed enters the
+    'monitor (firmware upload mode) instead of running the application.
+    if reboot_pending = YES then
+        if button.pressed = NO then
+            sys.debugprint("Rebooting to load the new certificate...\r\n")
+            sys.reboot
+        end if
+    end if
+
+    if upload_sock <> NO_SOCK then
+        upload_ticks = upload_ticks + 1
+        if upload_ticks >= UPLOAD_TIMEOUT_TICKS then
+            sock.num = upload_sock
+            upload_abort("timed out, the sender did not close the connection")
+        end if
+    end if
+
+    if client_busy = YES then
+        client_ticks = client_ticks + 1
+        if client_ticks >= CLIENT_TIMEOUT_TICKS then client_end("timed out")
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+'Long press: return to the certificates the firmware was built with. The flash
+'disk files are deleted now; the reboot, once MD is released, copies the ROM files again.
+sub restore_rom_certs()
+    if upload_sock <> NO_SOCK or reboot_pending = YES then
+        sys.debugprint("MD long press: an upload is in progress, certificates not changed\r\n")
+        exit sub
+    end if
+    sys.debugprint("MD long press: certificates deleted from the flash disk. Release MD to reboot.\r\n")
+    cert_store_reset()
+    reboot_pending = YES
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sock_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if sock.num = TLS_SERVER_SOCK then
+        tls_server_event(newstate, newstatesimple)
+    else if sock.num = TLS_CLIENT_SOCK then
+        client_event(newstate, newstatesimple)
+    else if sock.num = CA_UPLOAD_SOCK or sock.num = BUNDLE_UPLOAD_SOCK then
+        upload_event(newstate, newstatesimple)
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub on_sock_data_arrival()
+    if sock.num = TLS_SERVER_SOCK then
+        tls_server_echo()
+    else if sock.num = TLS_CLIENT_SOCK then
+        sock.rxclear
+    else if sock.num = CA_UPLOAD_SOCK or sock.num = BUNDLE_UPLOAD_SOCK then
+        upload_read()
+    end if
+end sub
+
+'==============================================================================
+' TLS server: echo, using the server bundle
+'==============================================================================
+sub tls_server_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if newstatesimple = PL_SSTS_CLOSED then
+        sock.rxclear
+        sock.txclear
+        sock.tlsdeinit
+        sys.debugprint("TLS server: connection closed\r\n")
+        exit sub
+    end if
+
+    select case newstate
+    case PL_SST_EST_POPENED:
+        sys.debugprint("TLS server: connection from " + sock.remoteip + ":" + str(sock.remoteport) + "\r\n")
+        if cert_size(CERT_BUNDLE) = 0 then
+            sys.debugprint("TLS server: no server bundle loaded, closing\r\n")
+            sock.close
+            exit sub
+        end if
+        sock.tlsdeinit
+        dim tls_res as pl_tls_result = cert_tls_init(CERT_BUNDLE)
+        if tls_res <> PL_TLS_SUCCESS then
+            sys.debugprint("TLS server: tlsinitfromarray FAILED (" + str(tls_res) + ")\r\n")
+            sock.close
+            exit sub
+        end if
+        tls_res = sock.tlshandshake("")
+        if tls_res <> PL_TLS_SUCCESS then
+            sys.debugprint("TLS server: tlshandshake FAILED (" + str(tls_res) + ")\r\n")
+            sock.close
+            exit sub
+        end if
+
+    case PL_SST_EST_TLS:
+        sys.debugprint("TLS server: TLS established\r\n")
+        sock.tlssetdata("Connected to CERT_UPDATE_PUSH. Send data to echo." + chr(13) + chr(10))
+        sock.send
+
+    case PL_SST_EST_TLS_FAILED:
+        sys.debugprint("TLS server: TLS handshake FAILED - resetting\r\n")
+        sock.rxclear
+        sock.reset
+    end select
+end sub
+
+'------------------------------------------------------------------------------
+sub tls_server_echo()
+    if sock.statesimple <> PL_SSTS_EST then exit sub
+    dim data as string = sock.tlsgetdata(255)
+    while len(data) > 0
+        sock.tlssetdata("ECHO: " + data)
+        sock.send
+        data = sock.tlsgetdata(255)
+    wend
+end sub
+
+'==============================================================================
+' TLS client test: connect to the PC server, checking it with the CA certificate
+'==============================================================================
+sub client_start()
+    if cert_size(CERT_CA) = 0 then
+        sys.debugprint("TLS client: no CA certificate loaded\r\n")
+        exit sub
+    end if
+    client_busy  = YES
+    client_ticks = 0
+    sock.num        = TLS_CLIENT_SOCK
+    sock.targetip   = PC_IP
+    sock.targetport = PC_TLS_PORT
+    sys.debugprint("TLS client: connecting to " + PC_IP + ":" + str(PC_TLS_PORT) + "...\r\n")
+    sock.connect
+end sub
+
+'------------------------------------------------------------------------------
+sub client_end(reason as string)
+    sys.debugprint("TLS client: " + reason + "\r\n")
+    client_busy = NO
+    sock.num = TLS_CLIENT_SOCK
+    if sock.statesimple <> PL_SSTS_CLOSED then sock.close
+end sub
+
+'------------------------------------------------------------------------------
+sub client_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if newstatesimple = PL_SSTS_CLOSED then
+        sock.rxclear
+        sock.txclear
+        sock.tlsdeinit
+        if client_busy = YES then
+            client_busy = NO
+            sys.debugprint("TLS client: connection closed before TLS was established (state=" + str(newstate) + ")\r\n")
+        end if
+        exit sub
+    end if
+
+    select case newstate
+    case PL_SST_EST_AOPENED:
+        sock.tlsdeinit
+        dim tls_res as pl_tls_result = cert_tls_init(CERT_CA)
+        if tls_res <> PL_TLS_SUCCESS then
+            client_end("tlsinitfromarray FAILED (" + str(tls_res) + ")")
+            exit sub
+        end if
+        tls_res = sock.tlshandshake(PC_IP)
+        if tls_res <> PL_TLS_SUCCESS then
+            client_end("tlshandshake FAILED (" + str(tls_res) + ")")
+            exit sub
+        end if
+        sys.debugprint("TLS client: TCP connected, TLS handshake started...\r\n")
+
+    case PL_SST_EST_TLS:
+        client_end("TLS established, the PC server passed the CA certificate check")
+
+    case PL_SST_EST_TLS_FAILED:
+        sys.debugprint("TLS client: TLS handshake FAILED, the PC server did not pass the CA certificate check\r\n")
+        client_busy = NO
+        sock.rxclear
+        sock.reset
+    end select
+end sub
+
+'==============================================================================
+' Uploads: the sender connects, sends the whole file, then closes the connection.
+' The close marks the end of the file. Only one upload runs at a time.
+'
+' These ports accept a certificate from anyone who can reach them. In a product,
+' replacements must be authenticated; see the CERT_UPDATE_PULL sample.
+'==============================================================================
+function upload_target(num as byte) as en_cert_target
+    if num = CA_UPLOAD_SOCK then
+        upload_target = CERT_CA
+    else
+        upload_target = CERT_BUNDLE
+    end if
+end function
+
+'------------------------------------------------------------------------------
+sub upload_event(newstate as pl_sock_state, newstatesimple as pl_sock_state_simple)
+    if newstate = PL_SST_EST_POPENED then
+        sys.debugprint("Upload: " + cert_label(upload_target(sock.num)) + " from " + sock.remoteip + "\r\n")
+        if upload_sock <> NO_SOCK or reboot_pending = YES then
+            sys.debugprint("Upload: busy, connection refused\r\n")
+            sock.close
+            exit sub
+        end if
+        if cert_new_open() <> OK then
+            sock.close
+            exit sub
+        end if
+        upload_sock  = sock.num
+        upload_ticks = 0
+        exit sub
+    end if
+
+    if newstatesimple = PL_SSTS_CLOSED then
+        if sock.num <> upload_sock then
+            'A refused or abandoned upload
+            sock.rxclear
+            exit sub
+        end if
+
+        'Data that arrived with the close is still in the RX buffer.
+        upload_read()
+        sock.rxclear
+        if upload_sock = NO_SOCK then exit sub
+
+        upload_sock = NO_SOCK
+        if cert_commit(upload_target(sock.num)) = OK then
+            sys.debugprint("Upload: " + cert_label(upload_target(sock.num)) + " replaced\r\n")
+            reboot_pending = YES
+        end if
+    end if
+end sub
+
+'------------------------------------------------------------------------------
+sub upload_read()
+    if sock.num <> upload_sock then
+        sock.rxclear
+        exit sub
+    end if
+    dim s as string = sock.getdata(255)
+    while s <> ""
+        if cert_new_write(s) <> OK then
+            upload_abort("could not store the file")
+            exit sub
+        end if
+        s = sock.getdata(255)
+    wend
+end sub
+
+'------------------------------------------------------------------------------
+'Gives up on the upload on the current socket. The current certificate is kept.
+sub upload_abort(reason as string)
+    sys.debugprint("Upload: ABORTED, " + reason + "\r\n")
+    cert_new_discard()
+    upload_sock = NO_SOCK
+    sock.rxclear
+    if sock.statesimple <> PL_SSTS_CLOSED then sock.close
+end sub
